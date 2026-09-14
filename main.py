@@ -3,6 +3,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import os
 from datetime import datetime
+import subprocess
+import shlex
+from pathlib import Path
 
 app = FastAPI(
     title="BeneX API",
@@ -17,6 +20,7 @@ origins = [
     "https://benex.net.br",
     "https://www.benex.net.br",
     "https://app.benex.net.br",
+    "https://prompt.benex.net.br",
     "https://api.benex.net.br",
     "http://localhost:3000",
     "http://localhost:5173",
@@ -36,6 +40,9 @@ class IAModel(BaseModel):
 
 class AppModel(BaseModel):
     mensagem: str
+
+class TerminalModel(BaseModel):
+    comando: str
 
 @app.get("/")
 def home():
@@ -91,3 +98,51 @@ def app_status():
 def webhook_whatsapp(client_id: str, payload: dict):
     # Deixa pronto pro futuro, sem usar agora
     return {"client_id": client_id, "recebido": True, "payload_keys": list(payload.keys())}
+
+@app.post("/executar")
+def executar_terminal(payload: TerminalModel):
+    comando = payload.comando.strip()
+
+    if not comando:
+        raise HTTPException(
+            status_code=400,
+            detail="comando vazio"
+        )
+
+    try:
+        partes = shlex.split(comando)
+
+        resultado = subprocess.run(
+            partes,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            shell=False
+        )
+
+        return {
+            "comando": comando,
+            "codigo": resultado.returncode,
+            "saida": resultado.stdout,
+            "erro": resultado.stderr,
+            "diretorio": str(Path.cwd()),
+            "timestamp": datetime.now().isoformat()
+        }
+
+    except FileNotFoundError:
+        raise HTTPException(
+            status_code=404,
+            detail="comando não encontrado no servidor"
+        )
+
+    except subprocess.TimeoutExpired:
+        raise HTTPException(
+            status_code=408,
+            detail="comando excedeu 30 segundos"
+        )
+
+    except Exception as erro:
+        raise HTTPException(
+            status_code=500,
+            detail=str(erro)
+        )
