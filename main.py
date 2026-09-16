@@ -4,12 +4,21 @@ from pydantic import BaseModel
 from datetime import datetime
 import subprocess
 import shlex
+import os
+import platform
+import shutil
+import sys
+import time
+import urllib.request
+import urllib.error
 from pathlib import Path
+
+INICIO_API = time.time()
 
 app = FastAPI(
     title="BeneX API",
     description="API principal da startup BeneX - Python + FastAPI - benex.net.br",
-    version="1.0.0",
+    version="1.1.0",
     docs_url="/docs",
     redoc_url="/redoc"
 )
@@ -81,12 +90,194 @@ def app_status():
         "app": "BeneX App",
         "dominio": "app.benex.net.br",
         "api": "api.benex.net.br",
-        "versao": "1.0.0"
+        "versao": "1.1.0"
     }
 
 @app.post("/webhook/whatsapp/{client_id}")
 def webhook_whatsapp(client_id: str, payload: dict):
     return {"client_id": client_id, "recebido": True, "payload_keys": list(payload.keys())}
+
+
+def formatar_duracao(segundos: float):
+    total = int(max(0, segundos))
+    dias, resto = divmod(total, 86400)
+    horas, resto = divmod(resto, 3600)
+    minutos, segundos = divmod(resto, 60)
+    partes = []
+    if dias:
+        partes.append(f"{dias}d")
+    if horas or dias:
+        partes.append(f"{horas}h")
+    if minutos or horas or dias:
+        partes.append(f"{minutos}m")
+    partes.append(f"{segundos}s")
+    return " ".join(partes)
+
+
+def checar_url(url: str, timeout=8):
+    inicio = time.perf_counter()
+    requisicao = urllib.request.Request(
+        url,
+        headers={"User-Agent": "BeneX-Terminal/1.1"}
+    )
+    try:
+        with urllib.request.urlopen(requisicao, timeout=timeout) as resposta:
+            latencia = int((time.perf_counter() - inicio) * 1000)
+            return True, resposta.status, latencia
+    except urllib.error.HTTPError as erro:
+        latencia = int((time.perf_counter() - inicio) * 1000)
+        return False, erro.code, latencia
+    except Exception:
+        latencia = int((time.perf_counter() - inicio) * 1000)
+        return False, None, latencia
+
+
+def executar_benex(tokens, diretorio: Path):
+    if not tokens or tokens[0].lower() != "benex":
+        return None
+
+    subcomando = tokens[1].lower() if len(tokens) > 1 else "help"
+    argumentos = tokens[2:]
+
+    if subcomando in ("help", "ajuda", "--help", "-h"):
+        saida = """BeneX Terminal Administrativo v1.1
+
+Comandos:
+  benex status       resumo do ecossistema BeneX
+  benex health       testa a API BeneX
+  benex site         testa o site principal
+  benex prompt       testa o terminal privado
+  benex services     testa os principais serviços HTTP
+  benex system       informações do servidor Render
+  benex disk         uso de armazenamento do servidor
+  benex env          lista apenas nomes das variáveis de ambiente
+  benex cwd          mostra o diretório atual
+  benex python       mostra a versão do Python
+  benex version      mostra a versão administrativa
+  benex help         mostra esta ajuda
+"""
+        return 0, saida, "", diretorio
+
+    if argumentos:
+        raise HTTPException(status_code=400, detail=f"benex {subcomando} não recebe argumentos")
+
+    if subcomando == "version":
+        return 0, "BeneX Terminal Administrativo v1.1\n", "", diretorio
+
+    if subcomando == "cwd":
+        return 0, f"{diretorio}\n", "", diretorio
+
+    if subcomando == "python":
+        return 0, f"Python {platform.python_version()}\n", "", diretorio
+
+    if subcomando == "health":
+        ok, codigo, ms = checar_url("https://api.benex.net.br/health")
+        estado = "ONLINE" if ok else "FALHA"
+        http = codigo if codigo is not None else "sem resposta"
+        return (0 if ok else 1), f"API BeneX: {estado} | HTTP {http} | {ms} ms\n", "", diretorio
+
+    if subcomando == "site":
+        ok, codigo, ms = checar_url("https://benex.net.br")
+        estado = "ONLINE" if ok else "FALHA"
+        http = codigo if codigo is not None else "sem resposta"
+        return (0 if ok else 1), f"Site BeneX: {estado} | HTTP {http} | {ms} ms\n", "", diretorio
+
+    if subcomando == "prompt":
+        ok, codigo, ms = checar_url("https://prompt.benex.net.br")
+        # Cloudflare Access pode responder com redirecionamento/login e ainda
+        # indicar que a borda privada está alcançável.
+        alcancavel = ok or (codigo is not None and 200 <= codigo < 500)
+        estado = "ALCANCAVEL" if alcancavel else "FALHA"
+        http = codigo if codigo is not None else "sem resposta"
+        return (0 if alcancavel else 1), f"Prompt privado: {estado} | HTTP {http} | {ms} ms\n", "", diretorio
+
+    if subcomando == "services":
+        servicos = [
+            ("API", "https://api.benex.net.br/health"),
+            ("Site", "https://benex.net.br"),
+            ("Prompt", "https://prompt.benex.net.br"),
+        ]
+        linhas = []
+        falhas = 0
+        for nome, url in servicos:
+            ok, codigo, ms = checar_url(url)
+            if nome == "Prompt":
+                ok = ok or (codigo is not None and 200 <= codigo < 500)
+            if not ok:
+                falhas += 1
+            estado = "OK" if ok else "FALHA"
+            http = codigo if codigo is not None else "---"
+            linhas.append(f"{nome:<8} {estado:<6} HTTP {http}  {ms} ms")
+        return (0 if falhas == 0 else 1), "\n".join(linhas) + "\n", "", diretorio
+
+    if subcomando == "system":
+        memoria = "indisponível"
+        try:
+            with open("/proc/meminfo", "r", encoding="utf-8") as arquivo:
+                dados = {}
+                for linha in arquivo:
+                    chave, valor = linha.split(":", 1)
+                    dados[chave] = valor.strip()
+                memoria = f"total {dados.get('MemTotal', '?')} | disponível {dados.get('MemAvailable', '?')}"
+        except Exception:
+            pass
+
+        saida = (
+            f"Sistema: {platform.system()} {platform.release()}\n"
+            f"Arquitetura: {platform.machine()}\n"
+            f"Python: {platform.python_version()}\n"
+            f"CPU lógica: {os.cpu_count() or 'indisponível'}\n"
+            f"Memória: {memoria}\n"
+            f"Diretório: {diretorio}\n"
+            f"Uptime API: {formatar_duracao(time.time() - INICIO_API)}\n"
+        )
+        return 0, saida, "", diretorio
+
+    if subcomando == "disk":
+        uso = shutil.disk_usage(diretorio)
+        gb = 1024 ** 3
+        percentual = (uso.used / uso.total * 100) if uso.total else 0
+        saida = (
+            f"Disco em {diretorio}\n"
+            f"Total: {uso.total / gb:.2f} GB\n"
+            f"Usado: {uso.used / gb:.2f} GB ({percentual:.1f}%)\n"
+            f"Livre: {uso.free / gb:.2f} GB\n"
+        )
+        return 0, saida, "", diretorio
+
+    if subcomando == "env":
+        nomes = sorted(os.environ.keys())
+        saida = "Variáveis disponíveis (valores ocultos):\n" + "\n".join(nomes) + "\n"
+        return 0, saida, "", diretorio
+
+    if subcomando == "status":
+        ok_api, codigo_api, ms_api = checar_url("https://api.benex.net.br/health")
+        ok_site, codigo_site, ms_site = checar_url("https://benex.net.br")
+        ok_prompt, codigo_prompt, ms_prompt = checar_url("https://prompt.benex.net.br")
+        ok_prompt = ok_prompt or (codigo_prompt is not None and 200 <= codigo_prompt < 500)
+
+        def linha(nome, ok, codigo, ms):
+            estado = "OK" if ok else "FALHA"
+            http = codigo if codigo is not None else "---"
+            return f"{nome:<8} {estado:<6} HTTP {http}  {ms} ms"
+
+        saida = (
+            "BeneX | Status Administrativo\n"
+            "-----------------------------\n"
+            + linha("API", ok_api, codigo_api, ms_api) + "\n"
+            + linha("Site", ok_site, codigo_site, ms_site) + "\n"
+            + linha("Prompt", ok_prompt, codigo_prompt, ms_prompt) + "\n"
+            + f"Servidor  {platform.system()} {platform.machine()} | Python {platform.python_version()}\n"
+            + f"Uptime    {formatar_duracao(time.time() - INICIO_API)}\n"
+            + f"Diretório {diretorio}\n"
+        )
+        codigo = 0 if ok_api and ok_site and ok_prompt else 1
+        return codigo, saida, "", diretorio
+
+    raise HTTPException(
+        status_code=400,
+        detail=f"comando BeneX desconhecido: {subcomando}. Use: benex help"
+    )
 
 
 def tokenizar(comando: str):
@@ -104,7 +295,6 @@ def resolver_arquivo(nome: str, diretorio: Path):
 
 
 def executar_pipeline(tokens, diretorio: Path):
-    # Redirecionamento de saída suportado no final: > arquivo ou >> arquivo.
     modo_saida = None
     arquivo_saida = None
 
@@ -140,11 +330,13 @@ def executar_pipeline(tokens, diretorio: Path):
     entrada_anterior = None
 
     try:
-        for i, segmento in enumerate(segmentos):
+        for segmento in segmentos:
             if not segmento:
                 raise HTTPException(status_code=400, detail="comando vazio no pipeline")
             if segmento[0] == "cd":
                 raise HTTPException(status_code=400, detail="cd não pode ser usado dentro de pipe")
+            if segmento[0].lower() == "benex":
+                raise HTTPException(status_code=400, detail="comandos benex não podem ser usados dentro de pipe")
 
             processo = subprocess.Popen(
                 segmento,
@@ -199,6 +391,10 @@ def executar_simples(tokens, diretorio: Path):
     if not tokens:
         raise HTTPException(status_code=400, detail="comando vazio")
 
+    benex = executar_benex(tokens, diretorio)
+    if benex is not None:
+        return benex
+
     if tokens[0] == "cd":
         if len(tokens) > 2:
             raise HTTPException(status_code=400, detail="uso: cd [diretório]")
@@ -243,8 +439,6 @@ def executar_terminal(payload: TerminalModel):
         if not tokens:
             raise HTTPException(status_code=400, detail="comando vazio")
 
-        # Divide a linha em blocos ligados por &&. O próximo bloco só roda
-        # quando o anterior termina com código 0, sem ativar shell=True.
         blocos = []
         bloco = []
         for token in tokens:
