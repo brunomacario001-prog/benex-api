@@ -2,448 +2,127 @@ from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from datetime import datetime
-import asyncio
-import fcntl
-import json
-import os
-import platform
-import pty
-import shlex
-import shutil
-import signal
-import struct
-import subprocess
-import sys
-import termios
-import time
-import urllib.error
-import urllib.request
+import asyncio, fcntl, json, os, platform, pty, shlex, shutil, signal, struct, subprocess, termios, time, urllib.error, urllib.request
 from pathlib import Path
-
-INICIO_API = time.time()
-
-app = FastAPI(
-    title="BeneX API",
-    description="API principal da startup BeneX - Python + FastAPI - benex.net.br",
-    version="1.2.0",
-    docs_url="/docs",
-    redoc_url="/redoc"
-)
-
-origins = [
-    "https://benex.net.br",
-    "https://www.benex.net.br",
-    "https://app.benex.net.br",
-    "https://prompt.benex.net.br",
-    "https://api.benex.net.br",
-    "http://localhost:3000",
-    "http://localhost:5173",
-]
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=origins,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-class IAModel(BaseModel):
-    texto: str
-    client_id: str = "default"
-
-class AppModel(BaseModel):
-    mensagem: str
-
-class TerminalModel(BaseModel):
-    comando: str
-    diretorio: str = "."
-
-@app.get("/")
-def home():
-    return {
-        "startup": "BeneX",
-        "dominio": "benex.net.br",
-        "status": "online",
-        "timestamp": datetime.now().isoformat(),
-        "endpoints": {
-            "docs": "https://api.benex.net.br/docs",
-            "health": "https://api.benex.net.br/health",
-            "ia": "https://api.benex.net.br/ia",
-            "terminal_ws": "wss://api.benex.net.br/terminal"
-        }
-    }
-
-@app.get("/health")
-def health_check():
-    return {"status": "ok", "service": "benex-api", "uptime": "running"}
-
-@app.post("/ia")
-def minha_ia(payload: IAModel):
-    if not payload.texto:
-        raise HTTPException(status_code=400, detail="texto vazio")
-    resposta_mock = f"BeneX recebeu: '{payload.texto}' - client: {payload.client_id}"
-    return {
-        "client_id": payload.client_id,
-        "pergunta": payload.texto,
-        "resposta": resposta_mock,
-        "modelo": "benex-v1-mock",
-        "timestamp": datetime.now().isoformat()
-    }
-
-@app.get("/app/status")
-def app_status():
-    return {
-        "app": "BeneX App",
-        "dominio": "app.benex.net.br",
-        "api": "api.benex.net.br",
-        "versao": "1.2.0"
-    }
-
-@app.post("/webhook/whatsapp/{client_id}")
-def webhook_whatsapp(client_id: str, payload: dict):
-    return {"client_id": client_id, "recebido": True, "payload_keys": list(payload.keys())}
-
-
-def formatar_duracao(segundos: float):
-    total = int(max(0, segundos))
-    dias, resto = divmod(total, 86400)
-    horas, resto = divmod(resto, 3600)
-    minutos, segundos = divmod(resto, 60)
-    partes = []
-    if dias:
-        partes.append(f"{dias}d")
-    if horas or dias:
-        partes.append(f"{horas}h")
-    if minutos or horas or dias:
-        partes.append(f"{minutos}m")
-    partes.append(f"{segundos}s")
-    return " ".join(partes)
-
-
-def checar_url(url: str, timeout=8):
-    inicio = time.perf_counter()
-    requisicao = urllib.request.Request(url, headers={"User-Agent": "BeneX-Terminal/1.2"})
-    try:
-        with urllib.request.urlopen(requisicao, timeout=timeout) as resposta:
-            latencia = int((time.perf_counter() - inicio) * 1000)
-            return True, resposta.status, latencia
-    except urllib.error.HTTPError as erro:
-        latencia = int((time.perf_counter() - inicio) * 1000)
-        return False, erro.code, latencia
-    except Exception:
-        latencia = int((time.perf_counter() - inicio) * 1000)
-        return False, None, latencia
-
-
-def executar_benex(tokens, diretorio: Path):
-    if not tokens or tokens[0].lower() != "benex":
-        return None
-    subcomando = tokens[1].lower() if len(tokens) > 1 else "help"
-    argumentos = tokens[2:]
-    if subcomando in ("help", "ajuda", "--help", "-h"):
-        saida = """BeneX Terminal Administrativo v1.2
-
-Comandos:
-  benex status       resumo do ecossistema BeneX
-  benex health       testa a API BeneX
-  benex site         testa o site principal
-  benex prompt       testa o terminal privado
-  benex services     testa os principais serviços HTTP
-  benex system       informações do servidor Render
-  benex disk         uso de armazenamento do servidor
-  benex env          lista apenas nomes das variáveis de ambiente
-  benex cwd          mostra o diretório atual
-  benex python       mostra a versão do Python
-  benex version      mostra a versão administrativa
-  benex help         mostra esta ajuda
-"""
-        return 0, saida, "", diretorio
-    if argumentos:
-        raise HTTPException(status_code=400, detail=f"benex {subcomando} não recebe argumentos")
-    if subcomando == "version":
-        return 0, "BeneX Terminal Administrativo v1.2\n", "", diretorio
-    if subcomando == "cwd":
-        return 0, f"{diretorio}\n", "", diretorio
-    if subcomando == "python":
-        return 0, f"Python {platform.python_version()}\n", "", diretorio
-    if subcomando == "health":
-        ok, codigo, ms = checar_url("https://api.benex.net.br/health")
-        estado = "ONLINE" if ok else "FALHA"
-        http = codigo if codigo is not None else "sem resposta"
-        return (0 if ok else 1), f"API BeneX: {estado} | HTTP {http} | {ms} ms\n", "", diretorio
-    if subcomando == "site":
-        ok, codigo, ms = checar_url("https://benex.net.br")
-        estado = "ONLINE" if ok else "FALHA"
-        http = codigo if codigo is not None else "sem resposta"
-        return (0 if ok else 1), f"Site BeneX: {estado} | HTTP {http} | {ms} ms\n", "", diretorio
-    if subcomando == "prompt":
-        ok, codigo, ms = checar_url("https://prompt.benex.net.br")
-        alcancavel = ok or (codigo is not None and 200 <= codigo < 500)
-        estado = "ALCANCAVEL" if alcancavel else "FALHA"
-        http = codigo if codigo is not None else "sem resposta"
-        return (0 if alcancavel else 1), f"Prompt privado: {estado} | HTTP {http} | {ms} ms\n", "", diretorio
-    if subcomando == "services":
-        servicos = [("API", "https://api.benex.net.br/health"), ("Site", "https://benex.net.br"), ("Prompt", "https://prompt.benex.net.br")]
-        linhas, falhas = [], 0
-        for nome, url in servicos:
-            ok, codigo, ms = checar_url(url)
-            if nome == "Prompt":
-                ok = ok or (codigo is not None and 200 <= codigo < 500)
-            if not ok:
-                falhas += 1
-            linhas.append(f"{nome:<8} {'OK' if ok else 'FALHA':<6} HTTP {codigo if codigo is not None else '---'}  {ms} ms")
-        return (0 if falhas == 0 else 1), "\n".join(linhas) + "\n", "", diretorio
-    if subcomando == "system":
-        memoria = "indisponível"
-        try:
-            with open("/proc/meminfo", "r", encoding="utf-8") as arquivo:
-                dados = {}
-                for linha in arquivo:
-                    chave, valor = linha.split(":", 1)
-                    dados[chave] = valor.strip()
-                memoria = f"total {dados.get('MemTotal', '?')} | disponível {dados.get('MemAvailable', '?')}"
-        except Exception:
-            pass
-        saida = (f"Sistema: {platform.system()} {platform.release()}\n" f"Arquitetura: {platform.machine()}\n" f"Python: {platform.python_version()}\n" f"CPU lógica: {os.cpu_count() or 'indisponível'}\n" f"Memória: {memoria}\n" f"Diretório: {diretorio}\n" f"Uptime API: {formatar_duracao(time.time() - INICIO_API)}\n")
-        return 0, saida, "", diretorio
-    if subcomando == "disk":
-        uso = shutil.disk_usage(diretorio)
-        gb = 1024 ** 3
-        percentual = (uso.used / uso.total * 100) if uso.total else 0
-        saida = (f"Disco em {diretorio}\n" f"Total: {uso.total / gb:.2f} GB\n" f"Usado: {uso.used / gb:.2f} GB ({percentual:.1f}%)\n" f"Livre: {uso.free / gb:.2f} GB\n")
-        return 0, saida, "", diretorio
-    if subcomando == "env":
-        nomes = sorted(os.environ.keys())
-        return 0, "Variáveis disponíveis (valores ocultos):\n" + "\n".join(nomes) + "\n", "", diretorio
-    if subcomando == "status":
-        ok_api, codigo_api, ms_api = checar_url("https://api.benex.net.br/health")
-        ok_site, codigo_site, ms_site = checar_url("https://benex.net.br")
-        ok_prompt, codigo_prompt, ms_prompt = checar_url("https://prompt.benex.net.br")
-        ok_prompt = ok_prompt or (codigo_prompt is not None and 200 <= codigo_prompt < 500)
-        def linha(nome, ok, codigo, ms):
-            return f"{nome:<8} {'OK' if ok else 'FALHA':<6} HTTP {codigo if codigo is not None else '---'}  {ms} ms"
-        saida = ("BeneX | Status Administrativo\n-----------------------------\n" + linha("API", ok_api, codigo_api, ms_api) + "\n" + linha("Site", ok_site, codigo_site, ms_site) + "\n" + linha("Prompt", ok_prompt, codigo_prompt, ms_prompt) + "\n" + f"Servidor  {platform.system()} {platform.machine()} | Python {platform.python_version()}\n" + f"Uptime    {formatar_duracao(time.time() - INICIO_API)}\n" + f"Diretório {diretorio}\n")
-        return (0 if ok_api and ok_site and ok_prompt else 1), saida, "", diretorio
-    raise HTTPException(status_code=400, detail=f"comando BeneX desconhecido: {subcomando}. Use: benex help")
-
-
-def tokenizar(comando: str):
-    lexer = shlex.shlex(comando, posix=True, punctuation_chars="|&><;")
-    lexer.whitespace_split = True
-    lexer.commenters = ""
-    return list(lexer)
-
-
-def resolver_arquivo(nome: str, diretorio: Path):
-    caminho = Path(nome).expanduser()
-    if not caminho.is_absolute():
-        caminho = diretorio / caminho
-    return caminho.resolve()
-
-
-def executar_pipeline(tokens, diretorio: Path):
-    modo_saida, arquivo_saida = None, None
-    for operador in (">>", ">"):
-        if operador in tokens:
-            indice = tokens.index(operador)
-            if indice == 0 or indice != len(tokens) - 2:
-                raise HTTPException(status_code=400, detail=f"uso inválido de {operador}")
-            modo_saida = operador
-            arquivo_saida = resolver_arquivo(tokens[indice + 1], diretorio)
-            tokens = tokens[:indice]
-            break
-    if ">" in tokens or ">>" in tokens:
-        raise HTTPException(status_code=400, detail="redirecionamento múltiplo não suportado")
-    segmentos, atual = [], []
-    for token in tokens:
-        if token == "|":
-            if not atual:
-                raise HTTPException(status_code=400, detail="pipe inválido")
-            segmentos.append(atual); atual = []
-        else:
-            atual.append(token)
-    if not atual:
-        raise HTTPException(status_code=400, detail="pipe inválido")
-    segmentos.append(atual)
-    processos, entrada_anterior = [], None
-    try:
-        for segmento in segmentos:
-            if segmento[0] == "cd":
-                raise HTTPException(status_code=400, detail="cd não pode ser usado dentro de pipe")
-            if segmento[0].lower() == "benex":
-                raise HTTPException(status_code=400, detail="comandos benex não podem ser usados dentro de pipe")
-            processo = subprocess.Popen(segmento, cwd=str(diretorio), stdin=entrada_anterior, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, shell=False)
-            if entrada_anterior is not None:
-                entrada_anterior.close()
-            processos.append(processo); entrada_anterior = processo.stdout
-        saida, erro_final = processos[-1].communicate(timeout=30)
-        erros = []
-        for processo in processos[:-1]:
-            try:
-                _, erro = processo.communicate(timeout=30)
-            except ValueError:
-                processo.wait(timeout=30); erro = processo.stderr.read() if processo.stderr else ""
-            if erro:
-                erros.append(erro)
-        if erro_final:
-            erros.append(erro_final)
-        codigo = processos[-1].returncode
-        if modo_saida:
-            arquivo_saida.parent.mkdir(parents=True, exist_ok=True)
-            with open(arquivo_saida, "a" if modo_saida == ">>" else "w", encoding="utf-8") as arquivo:
-                arquivo.write(saida)
-            saida = ""
-        return codigo, saida, "".join(erros)
-    except subprocess.TimeoutExpired:
-        for processo in processos:
-            if processo.poll() is None:
-                processo.kill()
-        raise
-
-
-def executar_simples(tokens, diretorio: Path):
-    if not tokens:
-        raise HTTPException(status_code=400, detail="comando vazio")
-    benex = executar_benex(tokens, diretorio)
-    if benex is not None:
-        return benex
-    if tokens[0] == "cd":
-        if len(tokens) > 2:
-            raise HTTPException(status_code=400, detail="uso: cd [diretório]")
-        novo = Path.home() if len(tokens) == 1 else (Path(tokens[1]).expanduser() if Path(tokens[1]).expanduser().is_absolute() else diretorio / Path(tokens[1]).expanduser())
-        novo = novo.resolve()
-        if not novo.exists():
-            raise HTTPException(status_code=404, detail="diretório não encontrado")
-        if not novo.is_dir():
-            raise HTTPException(status_code=400, detail="o destino não é um diretório")
-        return 0, "", "", novo
-    codigo, saida, erro = executar_pipeline(tokens, diretorio)
-    return codigo, saida, erro, diretorio
-
-
-@app.post("/executar")
-def executar_terminal(payload: TerminalModel):
-    comando = payload.comando.strip()
-    if not comando:
-        raise HTTPException(status_code=400, detail="comando vazio")
-    try:
-        if not payload.diretorio or payload.diretorio == ".":
-            diretorio_atual = Path.cwd().resolve()
-        else:
-            diretorio_atual = Path(payload.diretorio).expanduser()
-            if not diretorio_atual.is_absolute():
-                diretorio_atual = Path.cwd() / diretorio_atual
-            diretorio_atual = diretorio_atual.resolve()
-        if not diretorio_atual.exists() or not diretorio_atual.is_dir():
-            raise HTTPException(status_code=400, detail="diretório atual inválido")
-        tokens = tokenizar(comando)
-        blocos, bloco = [], []
-        for token in tokens:
-            if token == "&&":
-                if not bloco:
-                    raise HTTPException(status_code=400, detail="uso inválido de &&")
-                blocos.append(bloco); bloco = []
-            elif token in (";", "||", "&"):
-                raise HTTPException(status_code=400, detail=f"operador {token} ainda não suportado")
-            else:
-                bloco.append(token)
-        if not bloco:
-            raise HTTPException(status_code=400, detail="uso inválido de &&")
-        blocos.append(bloco)
-        saida_total, erro_total, codigo = [], [], 0
-        for bloco in blocos:
-            codigo, saida, erro, diretorio_atual = executar_simples(bloco, diretorio_atual)
-            if saida: saida_total.append(saida)
-            if erro: erro_total.append(erro)
-            if codigo != 0: break
-        return {"comando": comando, "codigo": codigo, "saida": "".join(saida_total), "erro": "".join(erro_total), "diretorio": str(diretorio_atual), "timestamp": datetime.now().isoformat()}
-    except HTTPException:
-        raise
-    except FileNotFoundError:
-        raise HTTPException(status_code=404, detail="comando não encontrado no servidor")
-    except subprocess.TimeoutExpired:
-        raise HTTPException(status_code=408, detail="comando excedeu 30 segundos")
-    except Exception as erro:
-        raise HTTPException(status_code=500, detail=str(erro))
-
-
-def ajustar_tamanho_pty(fd: int, linhas: int, colunas: int):
-    linhas = max(2, min(int(linhas), 500))
-    colunas = max(2, min(int(colunas), 500))
-    fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", linhas, colunas, 0, 0))
-
-
-async def ler_pty(websocket: WebSocket, fd: int):
-    loop = asyncio.get_running_loop()
-    while True:
-        try:
-            dados = await loop.run_in_executor(None, os.read, fd, 4096)
-            if not dados:
-                break
-            await websocket.send_text(dados.decode("utf-8", errors="replace"))
-        except OSError:
-            break
-
-
-@app.websocket("/terminal")
-async def terminal_websocket(websocket: WebSocket):
-    origem = websocket.headers.get("origin")
-    if origem not in origins:
-        await websocket.close(code=1008, reason="Origem não autorizada")
-        return
-
-    await websocket.accept()
-    pid = None
-    fd = None
-    tarefa_leitura = None
-
-    try:
-        pid, fd = pty.fork()
-        if pid == 0:
-            ambiente = os.environ.copy()
-            ambiente["TERM"] = "xterm-256color"
-            ambiente["COLORTERM"] = "truecolor"
-            ambiente["PS1"] = r"benex@servidor:\w$ "
-            shell = shutil.which("bash") or "/bin/sh"
-            os.execvpe(shell, [shell, "--noprofile", "--norc", "-i"] if shell.endswith("bash") else [shell, "-i"], ambiente)
-
-        ajustar_tamanho_pty(fd, 24, 80)
-        tarefa_leitura = asyncio.create_task(ler_pty(websocket, fd))
-
-        while True:
-            mensagem = await websocket.receive_text()
-            try:
-                pacote = json.loads(mensagem)
-            except json.JSONDecodeError:
-                pacote = {"type": "input", "data": mensagem}
-
-            tipo = pacote.get("type", "input")
-            if tipo == "input":
-                dados = str(pacote.get("data", "")).encode("utf-8")
-                if dados:
-                    os.write(fd, dados)
-            elif tipo == "resize":
-                ajustar_tamanho_pty(fd, pacote.get("rows", 24), pacote.get("cols", 80))
-            elif tipo == "signal" and pacote.get("signal") == "SIGINT":
-                os.killpg(pid, signal.SIGINT)
-
-    except WebSocketDisconnect:
-        pass
-    finally:
-        if tarefa_leitura:
-            tarefa_leitura.cancel()
-        if fd is not None:
-            try:
-                os.close(fd)
-            except OSError:
-                pass
-        if pid:
-            try:
-                os.kill(pid, signal.SIGHUP)
-            except ProcessLookupError:
-                pass
-            try:
-                os.waitpid(pid, os.WNOHANG)
-            except ChildProcessError:
-                pass
+INICIO_API=time.time()
+app=FastAPI(title='BeneX API',description='API principal da startup BeneX - Python + FastAPI - benex.net.br',version='1.3.0',docs_url='/docs',redoc_url='/redoc')
+origins=['https://benex.net.br','https://www.benex.net.br','https://app.benex.net.br','https://prompt.benex.net.br','https://api.benex.net.br','http://localhost:3000','http://localhost:5173']
+app.add_middleware(CORSMiddleware,allow_origins=origins,allow_credentials=True,allow_methods=['*'],allow_headers=['*'])
+class IAModel(BaseModel): texto:str; client_id:str='default'
+class TerminalModel(BaseModel): comando:str; diretorio:str='.'
+def duracao(s):
+ s=int(max(0,s)); d,s=divmod(s,86400); h,s=divmod(s,3600); m,s=divmod(s,60); return (f'{d}d ' if d else '')+(f'{h}h ' if h or d else '')+(f'{m}m ' if m or h or d else '')+f'{s}s'
+def memoria():
+ dados={}
+ try:
+  for linha in open('/proc/meminfo',encoding='utf-8'):
+   k,v=linha.split(':',1); dados[k]=int(v.strip().split()[0])*1024
+ except Exception: pass
+ return dados.get('MemTotal',0),dados.get('MemAvailable',0)
+@app.get('/')
+def home(): return {'startup':'BeneX','status':'online','version':'1.3.0'}
+@app.get('/health')
+def health(): return {'status':'ok','service':'benex-api','uptime':duracao(time.time()-INICIO_API),'version':'1.3.0'}
+@app.get('/system')
+def system_status():
+ total,disp=memoria(); uso=shutil.disk_usage(Path.cwd()); gb=1024**3
+ return {'status':'ok','system':platform.system(),'release':platform.release(),'architecture':platform.machine(),'python':platform.python_version(),'cpu_logical':os.cpu_count() or 0,'memory':{'total_gb':round(total/gb,2),'available_gb':round(disp/gb,2),'used_percent':round((total-disp)/total*100,1) if total else 0},'disk':{'total_gb':round(uso.total/gb,2),'used_gb':round(uso.used/gb,2),'free_gb':round(uso.free/gb,2),'used_percent':round(uso.used/uso.total*100,1) if uso.total else 0},'uptime':duracao(time.time()-INICIO_API)}
+@app.post('/ia')
+def ia(p:IAModel): return {'client_id':p.client_id,'pergunta':p.texto,'resposta':f"BeneX recebeu: '{p.texto}' - client: {p.client_id}",'modelo':'benex-v1-mock','timestamp':datetime.now().isoformat()}
+@app.get('/app/status')
+def app_status(): return {'app':'BeneX App','api':'api.benex.net.br','versao':'1.3.0'}
+def checar_url(url,timeout=8):
+ inicio=time.perf_counter()
+ try:
+  with urllib.request.urlopen(urllib.request.Request(url,headers={'User-Agent':'BeneX-Terminal/1.3'}),timeout=timeout) as r:return True,r.status,int((time.perf_counter()-inicio)*1000)
+ except urllib.error.HTTPError as e:return False,e.code,int((time.perf_counter()-inicio)*1000)
+ except Exception:return False,None,int((time.perf_counter()-inicio)*1000)
+def executar_benex(t,cwd):
+ if not t or t[0].lower()!='benex':return None
+ sub=t[1].lower() if len(t)>1 else 'help'
+ if len(t)>2:raise HTTPException(400,f'benex {sub} não recebe argumentos')
+ if sub in ('help','ajuda','--help','-h'):return 0,'BeneX Terminal Administrativo v1.3\nComandos: status health site prompt services system disk env cwd python version help\n','',cwd
+ if sub=='version':return 0,'BeneX Terminal Administrativo v1.3\n','',cwd
+ if sub=='cwd':return 0,f'{cwd}\n','',cwd
+ if sub=='python':return 0,f'Python {platform.python_version()}\n','',cwd
+ if sub in ('health','site','prompt'):
+  u={'health':'https://api.benex.net.br/health','site':'https://benex.net.br','prompt':'https://prompt.benex.net.br'}[sub];ok,code,ms=checar_url(u);ok=ok or(sub=='prompt' and code is not None and 200<=code<500);return 0 if ok else 1,f"{sub}: {'ONLINE' if ok else 'FALHA'} | HTTP {code or '---'} | {ms} ms\n",'',cwd
+ if sub=='system':
+  total,disp=memoria();gb=1024**3;return 0,f'Sistema: {platform.system()} {platform.release()}\nArquitetura: {platform.machine()}\nPython: {platform.python_version()}\nCPU lógica: {os.cpu_count()}\nMemória: total {total/gb:.2f} GB | disponível {disp/gb:.2f} GB\nUptime API: {duracao(time.time()-INICIO_API)}\n','',cwd
+ if sub=='disk':
+  u=shutil.disk_usage(cwd);gb=1024**3;return 0,f'Total: {u.total/gb:.2f} GB\nUsado: {u.used/gb:.2f} GB ({u.used/u.total*100:.1f}%)\nLivre: {u.free/gb:.2f} GB\n','',cwd
+ if sub=='env':return 0,'Variáveis disponíveis (valores ocultos):\n'+'\n'.join(sorted(os.environ))+'\n','',cwd
+ if sub in ('services','status'):
+  linhas=[];falhas=0
+  for n,u in [('API','https://api.benex.net.br/health'),('Site','https://benex.net.br'),('Prompt','https://prompt.benex.net.br')]:
+   ok,code,ms=checar_url(u);ok=ok or(n=='Prompt' and code is not None and 200<=code<500);falhas+=not ok;linhas.append(f"{n:<8} {'OK' if ok else 'FALHA':<6} HTTP {code or '---'} {ms} ms")
+  return 0 if not falhas else 1,'\n'.join(linhas)+'\n','',cwd
+ raise HTTPException(400,f'comando BeneX desconhecido: {sub}')
+def tokenizar(c):
+ l=shlex.shlex(c,posix=True,punctuation_chars='|&><;');l.whitespace_split=True;l.commenters='';return list(l)
+def pipeline(t,cwd):
+ modo=arquivo=None
+ for op in ('>>','>'):
+  if op in t:
+   i=t.index(op)
+   if i==0 or i!=len(t)-2:raise HTTPException(400,f'uso inválido de {op}')
+   modo=op;arquivo=(cwd/Path(t[i+1])).resolve();t=t[:i];break
+ seg=[];at=[]
+ for x in t:
+  if x=='|':
+   if not at:raise HTTPException(400,'pipe inválido')
+   seg.append(at);at=[]
+  else:at.append(x)
+ if not at:raise HTTPException(400,'pipe inválido')
+ seg.append(at);ps=[];entrada=None
+ for s in seg:
+  p=subprocess.Popen(s,cwd=str(cwd),stdin=entrada,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,shell=False)
+  if entrada:entrada.close()
+  ps.append(p);entrada=p.stdout
+ out,err=ps[-1].communicate(timeout=30);code=ps[-1].returncode
+ if modo:
+  with open(arquivo,'a' if modo=='>>' else 'w',encoding='utf-8') as f:f.write(out)
+  out=''
+ return code,out,err
+def executar(c,cwd):
+ t=tokenizar(c)
+ for op in (';','||','&'):
+  if op in t:raise HTTPException(400,f'operador não suportado: {op}')
+ b=executar_benex(t,cwd)
+ if b:return b
+ if t and t[0]=='cd':
+  novo=(Path.home() if len(t)==1 else (cwd/Path(t[1]))).resolve()
+  if not novo.is_dir():raise HTTPException(404,'diretório não encontrado')
+  return 0,'','',novo
+ code,out,err=pipeline(t,cwd);return code,out,err,cwd
+@app.post('/executar')
+def executar_terminal(p:TerminalModel):
+ try:
+  cwd=Path(p.diretorio).expanduser().resolve();cwd=cwd if cwd.is_dir() else Path.cwd();code,out,err,novo=executar(p.comando.strip(),cwd);return {'codigo':code,'saida':out,'erro':err,'diretorio':str(novo)}
+ except HTTPException:raise
+ except Exception as e:raise HTTPException(500,f'erro interno: {type(e).__name__}')
+def resize(fd,r,c):fcntl.ioctl(fd,termios.TIOCSWINSZ,struct.pack('HHHH',r,c,0,0))
+async def ler(ws,fd):
+ while True:
+  try:d=await asyncio.to_thread(os.read,fd,4096)
+  except OSError:break
+  if not d:break
+  try:await ws.send_text(d.decode(errors='replace'))
+  except Exception:break
+@app.websocket('/terminal')
+async def terminal(ws:WebSocket):
+ if ws.headers.get('origin') not in origins:await ws.close(code=1008);return
+ await ws.accept();pid,fd=pty.fork()
+ if pid==0:
+  os.environ.update(TERM='xterm-256color',COLORTERM='truecolor',PS1='benex@servidor:\\w$ ');shell='/bin/bash' if os.path.exists('/bin/bash') else '/bin/sh';os.execv(shell,[shell,'--noprofile','--norc','-i'] if shell.endswith('bash') else [shell,'-i'])
+ leitor=asyncio.create_task(ler(ws,fd));resize(fd,30,120)
+ try:
+  while True:
+   m=json.loads(await ws.receive_text());tipo=m.get('type')
+   if tipo=='input':await asyncio.to_thread(os.write,fd,m.get('data','').encode())
+   elif tipo=='resize':resize(fd,max(2,min(int(m.get('rows',30)),200)),max(10,min(int(m.get('cols',120)),400)))
+ except WebSocketDisconnect:pass
+ finally:
+  leitor.cancel()
+  try:os.close(fd);os.kill(pid,signal.SIGHUP)
+  except OSError:pass
