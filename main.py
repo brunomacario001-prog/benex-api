@@ -43,6 +43,7 @@ class AppModel(BaseModel):
 
 class TerminalModel(BaseModel):
     comando: str
+    diretorio: str = "."
 
 @app.get("/")
 def home():
@@ -71,11 +72,11 @@ def minha_ia(payload: IAModel):
     """
     if not payload.texto:
         raise HTTPException(status_code=400, detail="texto vazio")
-    
+
     # TODO: Coloque sua IA aqui
     # Exemplo: resposta = meu_modelo.predict(payload.texto)
     resposta_mock = f"BeneX recebeu: '{payload.texto}' - client: {payload.client_id}"
-    
+
     return {
         "client_id": payload.client_id,
         "pergunta": payload.texto,
@@ -104,16 +105,57 @@ def executar_terminal(payload: TerminalModel):
     comando = payload.comando.strip()
 
     if not comando:
-        raise HTTPException(
-            status_code=400,
-            detail="comando vazio"
-        )
+        raise HTTPException(status_code=400, detail="comando vazio")
 
     try:
+        if not payload.diretorio or payload.diretorio == ".":
+            diretorio_atual = Path.cwd().resolve()
+        else:
+            diretorio_atual = Path(payload.diretorio).expanduser()
+            if not diretorio_atual.is_absolute():
+                diretorio_atual = Path.cwd() / diretorio_atual
+            diretorio_atual = diretorio_atual.resolve()
+
+        if not diretorio_atual.exists() or not diretorio_atual.is_dir():
+            raise HTTPException(status_code=400, detail="diretório atual inválido")
+
         partes = shlex.split(comando)
+
+        if not partes:
+            raise HTTPException(status_code=400, detail="comando vazio")
+
+        # cd é interno do shell; tratamos diretamente para manter o diretório
+        # entre uma requisição do terminal e a próxima.
+        if partes[0] == "cd":
+            if len(partes) > 2:
+                raise HTTPException(status_code=400, detail="uso: cd [diretório]")
+
+            if len(partes) == 1:
+                novo_diretorio = Path.home()
+            else:
+                destino = Path(partes[1]).expanduser()
+                novo_diretorio = destino if destino.is_absolute() else diretorio_atual / destino
+
+            novo_diretorio = novo_diretorio.resolve()
+
+            if not novo_diretorio.exists():
+                raise HTTPException(status_code=404, detail="diretório não encontrado")
+
+            if not novo_diretorio.is_dir():
+                raise HTTPException(status_code=400, detail="o destino não é um diretório")
+
+            return {
+                "comando": comando,
+                "codigo": 0,
+                "saida": "",
+                "erro": "",
+                "diretorio": str(novo_diretorio),
+                "timestamp": datetime.now().isoformat()
+            }
 
         resultado = subprocess.run(
             partes,
+            cwd=str(diretorio_atual),
             capture_output=True,
             text=True,
             timeout=30,
@@ -125,24 +167,18 @@ def executar_terminal(payload: TerminalModel):
             "codigo": resultado.returncode,
             "saida": resultado.stdout,
             "erro": resultado.stderr,
-            "diretorio": str(Path.cwd()),
+            "diretorio": str(diretorio_atual),
             "timestamp": datetime.now().isoformat()
         }
 
+    except HTTPException:
+        raise
+
     except FileNotFoundError:
-        raise HTTPException(
-            status_code=404,
-            detail="comando não encontrado no servidor"
-        )
+        raise HTTPException(status_code=404, detail="comando não encontrado no servidor")
 
     except subprocess.TimeoutExpired:
-        raise HTTPException(
-            status_code=408,
-            detail="comando excedeu 30 segundos"
-        )
+        raise HTTPException(status_code=408, detail="comando excedeu 30 segundos")
 
     except Exception as erro:
-        raise HTTPException(
-            status_code=500,
-            detail=str(erro)
-        )
+        raise HTTPException(status_code=500, detail=str(erro))
