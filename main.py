@@ -1,7 +1,6 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-import os
 from datetime import datetime
 import subprocess
 import shlex
@@ -15,7 +14,6 @@ app = FastAPI(
     redoc_url="/redoc"
 )
 
-# CORS - libera seu frontend em benex.net.br e app.benex.net.br
 origins = [
     "https://benex.net.br",
     "https://www.benex.net.br",
@@ -65,18 +63,10 @@ def health_check():
 
 @app.post("/ia")
 def minha_ia(payload: IAModel):
-    """
-    Endpoint principal da sua IA.
-    Aqui você coloca sua lógica Python.
-    Hoje é um mock, amanhã você chama OpenAI, seu modelo treinado, etc.
-    """
     if not payload.texto:
         raise HTTPException(status_code=400, detail="texto vazio")
 
-    # TODO: Coloque sua IA aqui
-    # Exemplo: resposta = meu_modelo.predict(payload.texto)
     resposta_mock = f"BeneX recebeu: '{payload.texto}' - client: {payload.client_id}"
-
     return {
         "client_id": payload.client_id,
         "pergunta": payload.texto,
@@ -94,16 +84,146 @@ def app_status():
         "versao": "1.0.0"
     }
 
-# Rota para quando crescer e tiver multi-cliente
 @app.post("/webhook/whatsapp/{client_id}")
 def webhook_whatsapp(client_id: str, payload: dict):
-    # Deixa pronto pro futuro, sem usar agora
     return {"client_id": client_id, "recebido": True, "payload_keys": list(payload.keys())}
+
+
+def tokenizar(comando: str):
+    lexer = shlex.shlex(comando, posix=True, punctuation_chars="|&><;")
+    lexer.whitespace_split = True
+    lexer.commenters = ""
+    return list(lexer)
+
+
+def resolver_arquivo(nome: str, diretorio: Path):
+    caminho = Path(nome).expanduser()
+    if not caminho.is_absolute():
+        caminho = diretorio / caminho
+    return caminho.resolve()
+
+
+def executar_pipeline(tokens, diretorio: Path):
+    # Redirecionamento de saída suportado no final: > arquivo ou >> arquivo.
+    modo_saida = None
+    arquivo_saida = None
+
+    for operador in (">>", ">"):
+        if operador in tokens:
+            indice = tokens.index(operador)
+            if indice == 0 or indice != len(tokens) - 2:
+                raise HTTPException(status_code=400, detail=f"uso inválido de {operador}")
+            modo_saida = operador
+            arquivo_saida = resolver_arquivo(tokens[indice + 1], diretorio)
+            tokens = tokens[:indice]
+            break
+
+    if ">" in tokens or ">>" in tokens:
+        raise HTTPException(status_code=400, detail="redirecionamento múltiplo não suportado")
+
+    segmentos = []
+    atual = []
+    for token in tokens:
+        if token == "|":
+            if not atual:
+                raise HTTPException(status_code=400, detail="pipe inválido")
+            segmentos.append(atual)
+            atual = []
+        else:
+            atual.append(token)
+
+    if not atual:
+        raise HTTPException(status_code=400, detail="pipe inválido")
+    segmentos.append(atual)
+
+    processos = []
+    entrada_anterior = None
+
+    try:
+        for i, segmento in enumerate(segmentos):
+            if not segmento:
+                raise HTTPException(status_code=400, detail="comando vazio no pipeline")
+            if segmento[0] == "cd":
+                raise HTTPException(status_code=400, detail="cd não pode ser usado dentro de pipe")
+
+            processo = subprocess.Popen(
+                segmento,
+                cwd=str(diretorio),
+                stdin=entrada_anterior,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                shell=False
+            )
+
+            if entrada_anterior is not None:
+                entrada_anterior.close()
+
+            processos.append(processo)
+            entrada_anterior = processo.stdout
+
+        saida, erro_final = processos[-1].communicate(timeout=30)
+
+        erros = []
+        for processo in processos[:-1]:
+            try:
+                _, erro = processo.communicate(timeout=30)
+            except ValueError:
+                processo.wait(timeout=30)
+                erro = processo.stderr.read() if processo.stderr else ""
+            if erro:
+                erros.append(erro)
+
+        if erro_final:
+            erros.append(erro_final)
+
+        codigo = processos[-1].returncode
+
+        if modo_saida:
+            arquivo_saida.parent.mkdir(parents=True, exist_ok=True)
+            modo = "a" if modo_saida == ">>" else "w"
+            with open(arquivo_saida, modo, encoding="utf-8") as arquivo:
+                arquivo.write(saida)
+            saida = ""
+
+        return codigo, saida, "".join(erros)
+
+    except subprocess.TimeoutExpired:
+        for processo in processos:
+            if processo.poll() is None:
+                processo.kill()
+        raise
+
+
+def executar_simples(tokens, diretorio: Path):
+    if not tokens:
+        raise HTTPException(status_code=400, detail="comando vazio")
+
+    if tokens[0] == "cd":
+        if len(tokens) > 2:
+            raise HTTPException(status_code=400, detail="uso: cd [diretório]")
+
+        if len(tokens) == 1:
+            novo = Path.home()
+        else:
+            destino = Path(tokens[1]).expanduser()
+            novo = destino if destino.is_absolute() else diretorio / destino
+
+        novo = novo.resolve()
+        if not novo.exists():
+            raise HTTPException(status_code=404, detail="diretório não encontrado")
+        if not novo.is_dir():
+            raise HTTPException(status_code=400, detail="o destino não é um diretório")
+
+        return 0, "", "", novo
+
+    codigo, saida, erro = executar_pipeline(tokens, diretorio)
+    return codigo, saida, erro, diretorio
+
 
 @app.post("/executar")
 def executar_terminal(payload: TerminalModel):
     comando = payload.comando.strip()
-
     if not comando:
         raise HTTPException(status_code=400, detail="comando vazio")
 
@@ -119,66 +239,56 @@ def executar_terminal(payload: TerminalModel):
         if not diretorio_atual.exists() or not diretorio_atual.is_dir():
             raise HTTPException(status_code=400, detail="diretório atual inválido")
 
-        partes = shlex.split(comando)
-
-        if not partes:
+        tokens = tokenizar(comando)
+        if not tokens:
             raise HTTPException(status_code=400, detail="comando vazio")
 
-        # cd é interno do shell; tratamos diretamente para manter o diretório
-        # entre uma requisição do terminal e a próxima.
-        if partes[0] == "cd":
-            if len(partes) > 2:
-                raise HTTPException(status_code=400, detail="uso: cd [diretório]")
-
-            if len(partes) == 1:
-                novo_diretorio = Path.home()
+        # Divide a linha em blocos ligados por &&. O próximo bloco só roda
+        # quando o anterior termina com código 0, sem ativar shell=True.
+        blocos = []
+        bloco = []
+        for token in tokens:
+            if token == "&&":
+                if not bloco:
+                    raise HTTPException(status_code=400, detail="uso inválido de &&")
+                blocos.append(bloco)
+                bloco = []
+            elif token == ";" or token == "||" or token == "&":
+                raise HTTPException(status_code=400, detail=f"operador {token} ainda não suportado")
             else:
-                destino = Path(partes[1]).expanduser()
-                novo_diretorio = destino if destino.is_absolute() else diretorio_atual / destino
+                bloco.append(token)
 
-            novo_diretorio = novo_diretorio.resolve()
+        if not bloco:
+            raise HTTPException(status_code=400, detail="uso inválido de &&")
+        blocos.append(bloco)
 
-            if not novo_diretorio.exists():
-                raise HTTPException(status_code=404, detail="diretório não encontrado")
+        saida_total = []
+        erro_total = []
+        codigo = 0
 
-            if not novo_diretorio.is_dir():
-                raise HTTPException(status_code=400, detail="o destino não é um diretório")
-
-            return {
-                "comando": comando,
-                "codigo": 0,
-                "saida": "",
-                "erro": "",
-                "diretorio": str(novo_diretorio),
-                "timestamp": datetime.now().isoformat()
-            }
-
-        resultado = subprocess.run(
-            partes,
-            cwd=str(diretorio_atual),
-            capture_output=True,
-            text=True,
-            timeout=30,
-            shell=False
-        )
+        for bloco in blocos:
+            codigo, saida, erro, diretorio_atual = executar_simples(bloco, diretorio_atual)
+            if saida:
+                saida_total.append(saida)
+            if erro:
+                erro_total.append(erro)
+            if codigo != 0:
+                break
 
         return {
             "comando": comando,
-            "codigo": resultado.returncode,
-            "saida": resultado.stdout,
-            "erro": resultado.stderr,
+            "codigo": codigo,
+            "saida": "".join(saida_total),
+            "erro": "".join(erro_total),
             "diretorio": str(diretorio_atual),
             "timestamp": datetime.now().isoformat()
         }
 
     except HTTPException:
         raise
-
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail="comando não encontrado no servidor")
-
     except subprocess.TimeoutExpired:
         raise HTTPException(status_code=408, detail="comando excedeu 30 segundos")
-
     except Exception as erro:
         raise HTTPException(status_code=500, detail=str(erro))
