@@ -2,14 +2,14 @@ from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from datetime import datetime
-import asyncio, fcntl, json, os, platform, pty, shlex, shutil, signal, struct, subprocess, termios, time, urllib.error, urllib.request
+import asyncio, fcntl, hmac, json, os, platform, pty, shlex, shutil, signal, struct, subprocess, termios, time, urllib.error, urllib.request
 from pathlib import Path
 INICIO_API=time.time()
 app=FastAPI(title='BeneX API',description='API principal da startup BeneX - Python + FastAPI - benex.net.br',version='1.3.0',docs_url='/docs',redoc_url='/redoc')
 origins=['https://benex.net.br','https://www.benex.net.br','https://app.benex.net.br','https://prompt.benex.net.br','https://api.benex.net.br','http://localhost:3000','http://localhost:5173']
 app.add_middleware(CORSMiddleware,allow_origins=origins,allow_credentials=True,allow_methods=['*'],allow_headers=['*'])
 class IAModel(BaseModel): texto:str; client_id:str='default'
-class TerminalModel(BaseModel): comando:str; diretorio:str='.'
+class TerminalModel(BaseModel): comando:str; token:str; diretorio:str='.'
 def duracao(s):
  s=int(max(0,s)); d,s=divmod(s,86400); h,s=divmod(s,3600); m,s=divmod(s,60); return (f'{d}d ' if d else '')+(f'{h}h ' if h or d else '')+(f'{m}m ' if m or h or d else '')+f'{s}s'
 def memoria():
@@ -95,8 +95,12 @@ def executar(c,cwd):
   if not novo.is_dir():raise HTTPException(404,'diretório não encontrado')
   return 0,'','',novo
  code,out,err=pipeline(t,cwd);return code,out,err,cwd
+def chave_valida(token):
+ chave=os.getenv('BENEX_TERMINAL_KEY')
+ return bool(chave and isinstance(token,str) and hmac.compare_digest(token,chave))
 @app.post('/executar')
 def executar_terminal(p:TerminalModel):
+ if not chave_valida(p.token):raise HTTPException(401,'acesso não autorizado')
  try:
   cwd=Path(p.diretorio).expanduser().resolve();cwd=cwd if cwd.is_dir() else Path.cwd();code,out,err,novo=executar(p.comando.strip(),cwd);return {'codigo':code,'saida':out,'erro':err,'diretorio':str(novo)}
  except HTTPException:raise
@@ -112,7 +116,16 @@ async def ler(ws,fd):
 @app.websocket('/terminal')
 async def terminal(ws:WebSocket):
  if ws.headers.get('origin') not in origins:await ws.close(code=1008);return
- await ws.accept();pid,fd=pty.fork()
+ await ws.accept()
+ try:
+  autenticacao=json.loads(await asyncio.wait_for(ws.receive_text(),timeout=5))
+  if not isinstance(autenticacao,dict) or autenticacao.get('type')!='auth' or not chave_valida(autenticacao.get('token')):
+   await ws.close(code=1008);return
+ except WebSocketDisconnect:return
+ except (asyncio.TimeoutError,ValueError,TypeError):
+  await ws.close(code=1008);return
+ await ws.send_json({'type':'auth','ok':True})
+ pid,fd=pty.fork()
  if pid==0:
   os.environ.update(TERM='xterm-256color',COLORTERM='truecolor',PS1='benex@servidor:\\w$ ');shell='/bin/bash' if os.path.exists('/bin/bash') else '/bin/sh';os.execv(shell,[shell,'--noprofile','--norc','-i'] if shell.endswith('bash') else [shell,'-i'])
  leitor=asyncio.create_task(ler(ws,fd));resize(fd,30,120)
