@@ -1,0 +1,3 @@
+# Keep the interactive terminal's commands independent of the Render filesystem.
+PS1='benex@servidor:\w$ '
+benex() { python3 "$BENEX_CLI" "$@"; }
