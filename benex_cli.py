@@ -1,8 +1,8 @@
-"""Small, read-only BeneX commands available in the interactive terminal."""
+"""BeneX commands available in the authenticated interactive terminal."""
 
-import sys
 import shutil
 import subprocess
+import sys
 import tempfile
 import urllib.error
 import urllib.request
