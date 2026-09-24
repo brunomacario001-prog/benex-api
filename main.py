@@ -127,7 +127,7 @@ async def terminal(ws:WebSocket):
  await ws.send_json({'type':'auth','ok':True})
  pid,fd=pty.fork()
  if pid==0:
-  os.environ.update(TERM='xterm-256color',COLORTERM='truecolor',PS1='benex@servidor:\\w$ ');shell='/bin/bash' if os.path.exists('/bin/bash') else '/bin/sh';os.execv(shell,[shell,'--noprofile','--norc','-i'] if shell.endswith('bash') else [shell,'-i'])
+  os.environ.update(TERM='xterm-256color',COLORTERM='truecolor',PS1='benex@servidor:\\w$ ',BENEX_CLI=str(Path(__file__).with_name('benex_cli.py')));shell='/bin/bash' if os.path.exists('/bin/bash') else '/bin/sh';os.execv(shell,[shell,'--noprofile','--rcfile',str(Path(__file__).with_name('.benexrc')),'-i'] if shell.endswith('bash') else [shell,'-i'])
  leitor=asyncio.create_task(ler(ws,fd));resize(fd,30,120)
  try:
   while True:
